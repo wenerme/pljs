@@ -1,0 +1,47 @@
+# Dockerfile for building and testing pljs patches
+# Usage:
+#   docker build -f Dockerfile.test -t pljs-test .
+#   docker run --rm pljs-test
+#
+# Run specific test:
+#   docker run --rm pljs-test make installcheck REGRESS=function
+
+ARG PG_VERSION=18
+
+FROM postgres:${PG_VERSION}-alpine AS build
+
+RUN apk add --no-cache \
+    build-base \
+    postgresql-dev \
+    git \
+    patch \
+    cmake
+
+COPY . /tmp/pljs
+
+# patches + Alpine musl -fPIC fix
+RUN set -eux; \
+    cd /tmp/pljs; \
+    patch -p1 <patches/01-shared-lib-build; \
+    patch -p1 <patches/02-unicode-conflict; \
+    sed -i '/^CFLAGS/s/$/ -fPIC/' deps/quickjs/Makefile; \
+    make USE_PGXS=1 with_llvm=no -j$(nproc); \
+    make USE_PGXS=1 with_llvm=no install
+
+# Test stage: run regression tests
+FROM build AS test
+
+RUN chown -R postgres:postgres /tmp/pljs
+USER postgres
+RUN pg_ctl init -D /tmp/pgdata
+
+# Run tests (installcheck needs a running server)
+CMD set -eux; \
+    pg_ctl start -D /tmp/pgdata -l /tmp/pglog -o "-c shared_preload_libraries='' -c log_statement=none"; \
+    sleep 1; \
+    cd /tmp/pljs && make installcheck PGUSER=postgres || { \
+        echo "=== FAILED ===" ; \
+        cat regression.diffs 2>/dev/null ; \
+        exit 1 ; \
+    }; \
+    echo "=== ALL TESTS PASSED ==="
